@@ -1,0 +1,12 @@
+numpy
+netCDF4
+matplotlib
+basemap
+basemap-data-hires
+contextily
+geopandas
+scipy
+cartopy
+xarray
+metpy
+haversine
