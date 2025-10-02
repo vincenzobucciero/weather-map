@@ -1,8 +1,8 @@
-numpy
 netCDF4
+numpy
 matplotlib
 basemap
-basemap-data-hires
+basemap_data_hires
 contextily
 geopandas
 scipy
