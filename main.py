@@ -10,7 +10,7 @@ from haversine import haversine, Unit
 
 
 
-f = Dataset(r'data/opendap/wrf5/d02/archive/2025/09/13/wrf5_d02_20250913Z1200.nc', 'r')
+f = Dataset(r'data/opendap/wrf5/d01/archive/2025/09/13/wrf5_d01_20250913Z1200.nc', 'r')
 lats = f['latitude'][:]
 lons = f['longitude'][:]
 Lons, Lats = np.meshgrid(lons, lats)
@@ -87,3 +87,6 @@ for h in range(len(h_x)):
             plt.text(h_lons[h], h_lats[h], label, fontsize=14, color='blue', ha='center', va='center', fontweight='bold')
 
 plt.savefig("out.png", dpi=1200)
+
+
+plt.show()
