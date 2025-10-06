@@ -6,9 +6,10 @@ from netCDF4 import Dataset
 from scipy.ndimage import gaussian_filter
 from metpy.calc import find_peaks
 from haversine import haversine, Unit
+import time
 
 
-
+start_time = time.time()
 
 f = Dataset(r'data/opendap/wrf5/d01/archive/2025/09/13/wrf5_d01_20250913Z1200.nc', 'r')
 lats = f['latitude'][:]
@@ -87,6 +88,8 @@ for h in range(len(h_x)):
             plt.text(h_lons[h], h_lats[h], label, fontsize=14, color='blue', ha='center', va='center', fontweight='bold')
 
 plt.savefig("out.png", dpi=1200)
+
+print("Execution time: %s seconds" % (time.time() - start_time))
 
 
 plt.show()
