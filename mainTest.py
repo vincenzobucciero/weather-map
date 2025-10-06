@@ -1,205 +1,183 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 from matplotlib.colors import LinearSegmentedColormap
 from mpl_toolkits.basemap import Basemap
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
 import numpy as np
 from netCDF4 import Dataset
-from scipy.ndimage import gaussian_filter
-from metpy.calc import find_peaks
+from scipy.ndimage import gaussian_filter, minimum_filter, maximum_filter
 from haversine import haversine, Unit
 import time
 
-# =========================
-# Configurazione
-# =========================
-NC_PATH = r"data/opendap/wrf5/d02/archive/2025/09/13/wrf5_d02_20250913Z1200.nc"
+# -------------------- Config --------------------
+NC_PATH = r"data/opendap/wrf5/d01/archive/2025/09/13/wrf5_d01_20250913Z1200.nc"
 
-# Isoipse SLP
+# smoothing campo SLP (maggiore = meno punti, più pulito)
+GAUSS_SIGMA = 5
+# finestra per min/max locali (dispari, maggiore = meno punti)
+LOCAL_WIN = 15
+# percentile per selezionare aree a gradiente basso (più basso = più selettivo)
+GRAD_PCTL = 2
+# distanza minima tra centri selezionati (km)
+MIN_SEP_KM = 320
+# soglia tua per la matrice M
+M_THRESHOLD = 0.75e-03
+
+# livelli isobare
 SLP_MIN, SLP_MAX, SLP_STEP = 960, 1100, 2
 
-# Smoothing per SLP (consigliato 2–4)
-SLP_SIGMA = 4
+# colori badge
+COLOR_H_FACE = "#1976D2"
+COLOR_H_EDGE = "#0B3D91"
+COLOR_L_FACE = "#D32F2F"
+COLOR_L_EDGE = "#8B0000"
 
-# Criteri etichette (scegli assoluto o percentili)
-USE_PERCENTILES = True
-P_LOW, P_HIGH = 10, 90   # usati se USE_PERCENTILES=True
-ABS_SPLIT = 1013.0       # usato se USE_PERCENTILES=False
 
-# Metrica L–H: M = |ΔP| / (10 * distanza_km)
-M_THRESHOLD = 7.5e-4     # ~0.00075 hPa / (10 km)
-NEAR_RADIUS_KM = 700.0   # accoppia L–H solo entro questo raggio
+# -------------------- Utils --------------------
+def put_badge(ax, x, y, symbol, value, facecolor, edgecolor):
+    """Disegna un badge circolare con lettera e valore sotto."""
+    ax.text(
+        x, y, symbol,
+        fontsize=12, color="white", weight="bold",
+        ha="center", va="center",
+        bbox=dict(boxstyle="circle,pad=0.18",
+                  facecolor=facecolor, edgecolor=edgecolor,
+                  linewidth=1.0, alpha=0.95),
+        zorder=7,
+        path_effects=[pe.withStroke(linewidth=1.5, foreground="black", alpha=0.35)]
+    )
+    ax.annotate(
+        f"{int(round(float(value)))}",
+        xy=(x, y), xycoords="data",
+        xytext=(0, -10), textcoords="offset points",
+        ha="center", va="top",
+        fontsize=7, color=facecolor, weight="bold",
+        zorder=7,
+        path_effects=[pe.withStroke(linewidth=1.8, foreground="white", alpha=0.9)]
+    )
 
-# Estetica testo etichette
-LABEL_FONTSIZE = 8
 
-# =========================
-# Avvio timer
-# =========================
-t0 = time.time()
+def filter_by_distance(y_idx, x_idx, lats, lons, min_km=300):
+    """Greedy: tiene il primo punto e scarta i successivi più vicini di min_km."""
+    keep_y, keep_x = [], []
+    for i in range(len(y_idx)):
+        lat_i, lon_i = lats[y_idx[i]], lons[x_idx[i]]
+        if all(haversine((lat_i, lon_i), (lats[yy], lons[xx])) > min_km
+               for yy, xx in zip(keep_y, keep_x)):
+            keep_y.append(y_idx[i])
+            keep_x.append(x_idx[i])
+    return np.array(keep_y), np.array(keep_x)
 
-# =========================
-# Lettura dati
-# =========================
+
+# -------------------- Main --------------------
+start_time = time.time()
+
+# Caricamento dati
 f = Dataset(NC_PATH, "r")
-lats = f["latitude"][:]      # (ny,)
-lons = f["longitude"][:]     # (nx,)
-print(lats)
-print(lons)
-Lons, Lats = np.meshgrid(lons, lats)  # (ny, nx)
+lats = f["latitude"][:]
+lons = f["longitude"][:]
+Lons, Lats = np.meshgrid(lons, lats)
 
-# Variabiliprof 
-clf = f["CLDFRA_TOTAL"][0, :, :]     # [0] perché time=1
-slp = f["SLP"][0, :, :]
+clf = f["CLDFRA_TOTAL"][0, :, :]
+slp_raw = f["SLP"][0, :, :]
 
-# =========================
-# Pre-elaborazione SLP
-# =========================
-# SLP smussata per isoipse e rilevamento picchi
-slp_s = gaussian_filter(slp, sigma=SLP_SIGMA)
+# Smoothing per stabilizzare gradiente ed estremi
+slp = gaussian_filter(slp_raw, sigma=GAUSS_SIGMA)
 
-# Soglie per H/L
-if USE_PERCENTILES:
-    p10, p90 = np.percentile(slp, [P_LOW, P_HIGH])
-    low_cut, high_cut = p10, p90
-else:
-    low_cut, high_cut = ABS_SPLIT, ABS_SPLIT
+# Colormap per nubi trasparente -> bianco
+clf_cmap = LinearSegmentedColormap.from_list(
+    "transparent_clouds", [(1, 1, 1, 0), (1, 1, 1, 1)], N=256
+)
 
-# Livelli per isoipse
+# Livelli isobare
 levels = np.arange(SLP_MIN, SLP_MAX + SLP_STEP, SLP_STEP)
 
-# =========================
-# Rilevamento picchi (su SLP smussata)
-# =========================
-h_y, h_x = find_peaks(slp_s)               # massimi (H)
-l_y, l_x = find_peaks(slp_s, maxima=False) # minimi (L)
-
-print(f"Picchi trovati (prima del filtro M): H={len(h_y)}  L={len(l_y)}")
-
-# =========================
-# Basemap (limiti robusti)
-# =========================
-m = Basemap(
-    projection="merc",
-    llcrnrlat=float(np.min(lats)), urcrnrlat=float(np.max(lats)),
-    llcrnrlon=float(np.min(lons)), urcrnrlon=float(np.max(lons)),
-    lat_ts=20, resolution="h"
-)
+# --- Mappa ---
+m = Basemap(projection="merc",
+            llcrnrlat=lats[0], urcrnrlat=lats[-1],
+            llcrnrlon=lons[0], urcrnrlon=lons[-1],
+            lat_ts=20, resolution="h")
 m.bluemarble(scale=4)
-m.drawcoastlines(linewidth=0.6)
+m.drawcoastlines()
 
 x, y = m(Lons, Lats)
+plt.contourf(x, y, clf, cmap=clf_cmap, zorder=1)
+plt.contour(x, y, slp, colors="yellow", levels=levels,
+            linewidths=.5, linestyles="solid", zorder=2)
 
-# =========================
-# Layer: nuvolosità + isoipse SLP smussata
-# =========================
-# Colormap: bianco trasparente -> bianco opaco
-clf_cmap = LinearSegmentedColormap.from_list(
-    "transparent_clouds",
-    [(1, 1, 1, 0), (1, 1, 1, 1)],
-    N=256
-)
-plt.contourf(x, y, clf, levels=12, cmap=clf_cmap)
-plt.contour(x, y, slp_s, levels=levels, colors="yellow", linewidths=0.8, linestyles="solid")
+# === Gradiente & Laplaciano ===
+gy, gx = np.gradient(slp)           # dSLP/dlat, dSLP/dlon (in grid units)
+grad_mag = np.hypot(gx, gy)
 
-# =========================
-# Etichette H/L con filtro M e soglie
-# =========================
-def good_L(val):
-    return (val < low_cut) if USE_PERCENTILES else (val < ABS_SPLIT)
+gy_y, _ = np.gradient(gy)
+_, gx_x = np.gradient(gx)
+lap = gx_x + gy_y                   # Laplaciano
 
-def good_H(val):
-    return (val >= high_cut) if USE_PERCENTILES else (val >= ABS_SPLIT)
+# === Candidati: gradiente basso ===
+tau = np.percentile(grad_mag, GRAD_PCTL)
+crit_mask = grad_mag < tau
 
-# Prepara coordinate (geografiche) dei picchi
-H_lon1d = lons[h_x] if len(h_x) else np.array([])
-H_lat1d = lats[h_y] if len(h_y) else np.array([])
-L_lon1d = lons[l_x] if len(l_x) else np.array([])
-L_lat1d = lats[l_y] if len(l_y) else np.array([])
+# Estremi locali su finestra
+is_local_min = (slp == minimum_filter(slp, size=LOCAL_WIN)) & crit_mask
+is_local_max = (slp == maximum_filter(slp, size=LOCAL_WIN)) & crit_mask
 
-# Conteggio etichette finali
-nL_draw = nH_draw = 0
+# Classificazione con Laplaciano:
+#   lap < 0 -> massimo (H),  lap > 0 -> minimo (L)
+H_mask = is_local_max & (lap < 0)
+L_mask = is_local_min & (lap > 0)
 
-# --- Disegna L ---
-for iL in range(len(l_x)):
-    ly, lx = l_y[iL], l_x[iL]
-    pL = slp[ly, lx]  # valore reale (non smussato)
-    if not good_L(pL):
-        continue
+# Indici [y, x]
+h_y, h_x = np.where(H_mask)
+l_y, l_x = np.where(L_mask)
 
-    # Verifica accoppiamento con almeno un H entro raggio e M > soglia
-    draw = False
-    for iH in range(len(h_x)):
-        hy, hx = h_y[iH], h_x[iH]
-        # distanza geodetica
-        d_km = haversine((L_lat1d[iL], L_lon1d[iL]),
-                         (H_lat1d[iH], H_lon1d[iH]),
-                         unit=Unit.KILOMETERS)
-        if d_km == 0.0 or d_km > NEAR_RADIUS_KM:
-            continue
-        pH = slp[hy, hx]  # valore reale
-        M = abs(pL - pH) / (10.0 * d_km)
-        if M > M_THRESHOLD:
-            draw = True
-            break
+# Distanza minima tra centri per pulizia
+h_y, h_x = filter_by_distance(h_y, h_x, lats, lons, min_km=MIN_SEP_KM)
+l_y, l_x = filter_by_distance(l_y, l_x, lats, lons, min_km=MIN_SEP_KM)
 
-    if draw:
-        # posizioni in mappa
-        X, Y = m(L_lon1d[iL], L_lat1d[iL])
-        # Estrai valori scalari se sono array/lista
-        if isinstance(X, (np.ndarray, list)):
-            X = X[0]
-        if isinstance(Y, (np.ndarray, list)):
-            Y = Y[0]
-        plt.text(
-            X, Y,
-            f"L\n{round(float(pL))}",
-            fontsize=LABEL_FONTSIZE, color="red",
-            ha="center", va="center", fontweight="bold",
-            bbox=dict(facecolor="white", alpha=0.6, boxstyle="round,pad=0.2")
+# (Opzionale) limiti massimi: tieni i più prominenti
+MAX_KEEP = 200
+if len(h_y) > MAX_KEEP:
+    order = np.argsort(slp[h_y, h_x])[::-1]  # massimi più alti
+    h_y, h_x = h_y[order[:MAX_KEEP]], h_x[order[:MAX_KEEP]]
+if len(l_y) > MAX_KEEP:
+    order = np.argsort(slp[l_y, l_x])        # minimi più bassi
+    l_y, l_x = l_y[order[:MAX_KEEP]], l_x[order[:MAX_KEEP]]
+
+# Proiezione su mappa
+h_lons, h_lats = m(lons[h_x], lats[h_y])
+l_lons, l_lats = m(lons[l_x], lats[l_y])
+
+print("N. minimi (L), massimi (H):", len(l_y), len(h_y))
+
+# === Matrice M (tua logica) ===
+M = np.zeros((len(l_x), len(h_x)), dtype=float)
+for li in range(len(l_x)):
+    l_value = slp[l_y[li], l_x[li]]
+    for hi in range(len(h_x)):
+        dist_km = haversine(
+            (lats[l_y[li]], lons[l_x[li]]),
+            (lats[h_y[hi]], lons[h_x[hi]]),
+            unit=Unit.KILOMETERS
         )
-        nL_draw += 1
+        dist_km = max(dist_km, 1e-6)  # evita zero
+        M[li, hi] = abs(l_value - slp[h_y[hi], h_x[hi]]) / (10 * dist_km)
 
-# --- Disegna H ---
-for iH in range(len(h_x)):
-    hy, hx = h_y[iH], h_x[iH]
-    pH = slp[hy, hx]
-    if not good_H(pH):
-        continue
+print("M shape:", M.shape)
 
-    draw = False
-    for iL in range(len(l_x)):
-        ly, lx = l_y[iL], l_x[iL]
-        d_km = haversine((L_lat1d[iL], L_lon1d[iL]),
-                         (H_lat1d[iH], H_lon1d[iH]),
-                         unit=Unit.KILOMETERS)
-        if d_km == 0.0 or d_km > NEAR_RADIUS_KM:
-            continue
-        pL = slp[ly, lx]
-        M = abs(pL - pH) / (10.0 * d_km)
-        X, Y = m(H_lon1d[iH], H_lat1d[iH])
-        # Estrai valori scalari se sono array/lista
-        if isinstance(X, (np.ndarray, list)):
-            X = X[0]
-        if isinstance(Y, (np.ndarray, list)):
-            Y = Y[0]
-        plt.text(
-            X, Y,
-            f"H\n{round(float(pH))}",
-            fontsize=LABEL_FONTSIZE, color="blue",
-            ha="center", va="center", fontweight="bold",
-            bbox=dict(facecolor="white", alpha=0.6, boxstyle="round,pad=0.2")
-        )
-        nH_draw += 1
+# === Disegno etichette a badge ===
+ax = plt.gca()
 
-print(f"Etichette disegnate: H={nH_draw}  L={nL_draw}")
+for li in range(len(l_x)):
+    value = slp[l_y[li], l_x[li]]
+    if value < 1013 and np.any(M[li, :] > M_THRESHOLD):
+        put_badge(ax, l_lons[li], l_lats[li], "L", value,
+                  facecolor=COLOR_L_FACE, edgecolor=COLOR_L_EDGE)
 
-# =========================
-# Output
-# =========================
-plt.title("SLP (smoothed), clouds, and filtered H/L")
-plt.tight_layout()
-plt.savefig("out_clean.png", dpi=300)
-print(f"Tempo totale: {time.time() - t0:.2f} s")
+for hi in range(len(h_x)):
+    value = slp[h_y[hi], h_x[hi]]
+    if value >= 1013 and np.any(M[:, hi] > M_THRESHOLD):
+        put_badge(ax, h_lons[hi], h_lats[hi], "H", value,
+                  facecolor=COLOR_H_FACE, edgecolor=COLOR_H_EDGE)
+
+plt.savefig("out_badges.png", dpi=1200)
+print("Execution time: %s seconds" % (time.time() - start_time))
 plt.show()
